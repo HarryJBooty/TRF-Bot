@@ -415,7 +415,11 @@ async def log_event(ctx):
         await ctx.send("❌ You do not have permission to use this command.")
         return
 
-    await ctx.guild.chunk()
+    try:
+        await ctx.guild.chunk()
+    except Exception as e:
+        print(f"Warning: Could not chunk guild: {e}")
+        # Continue anyway, chunking is not critical
 
     def check_author(m):
         return (m.author == ctx.author) and (m.channel == ctx.channel)
@@ -496,99 +500,128 @@ async def log_event(ctx):
     attendee_pings_for_summary = []
     attendees_processed = []
 
-    for attendee_msg in attendees_input:
-        content = attendee_msg.content.strip()
-        mention_list = attendee_msg.mentions
+    try:
+        for attendee_msg in attendees_input:
+            content = attendee_msg.content.strip()
+            mention_list = attendee_msg.mentions
 
-        if mention_list:
-            # Attendee was a mention
-            attendee_member = mention_list[0]
-            ensure_user_record(attendee_member, ctx.guild)
+            if mention_list:
+                # Attendee was a mention
+                attendee_member = mention_list[0]
+                try:
+                    ensure_user_record(attendee_member, ctx.guild)
+                    cursor.execute(
+                        "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE DiscordID=%s",
+                        (str(attendee_member.id),)
+                    )
+                    conn.commit()
+
+                    attendees_processed.append(str(attendee_member.id))
+                    attendee_pings_for_summary.append(attendee_member.mention)
+                except Exception as e:
+                    await ctx.send(f"❌ Error processing attendee {attendee_member.mention}: {str(e)}")
+                    continue
+
+            elif content.isdigit():
+                # The input is a numeric Roblox ID
+                roblox_id = content
+                try:
+                    roblox_username = fetch_latest_roblox_username(roblox_id)
+                    cursor.execute("SELECT DiscordID FROM Users WHERE RobloxID=%s", (roblox_id,))
+                    row = cursor.fetchone()
+
+                    if row:
+                        # Already in the DB
+                        cursor.execute(
+                            "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE RobloxID=%s",
+                            (roblox_id,)
+                        )
+                        conn.commit()
+                        attendees_processed.append(str(row[0]))
+                    else:
+                        # Create new record with DiscordID='0'
+                        cursor.execute(
+                            """
+                            INSERT INTO Users (DiscordID, RobloxID, r_user, EventsAttended, EventsHosted,
+                                               FlightMinutes, QuotaMet, Rank, Strikes)
+                            VALUES (%s, %s, %s, 1, 0, 0, FALSE, %s, 0)
+                            """,
+                            ("0", roblox_id, roblox_username, "Unknown")
+                        )
+                        conn.commit()
+                        attendees_processed.append("0")
+                    attendee_pings_for_summary.append(f"RobloxID:{roblox_id}")
+                except Exception as e:
+                    await ctx.send(f"❌ Error processing Roblox ID {roblox_id}: {str(e)}")
+                    continue
+
+            else:
+                await ctx.send(f"❌ Could not parse attendee: {content}. Skipping.")
+                continue
+
+            await asyncio.sleep(RATE_LIMIT_DELAY)
+
+        # Host
+        try:
+            ensure_user_record(ctx.author, ctx.guild)
             cursor.execute(
-                "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE DiscordID=%s",
-                (str(attendee_member.id),)
+                "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
+                (str(ctx.author.id),)
             )
             conn.commit()
+        except Exception as e:
+            await ctx.send(f"❌ Error updating host record: {str(e)}")
+            return
 
-            attendees_processed.append(str(attendee_member.id))
-            attendee_pings_for_summary.append(attendee_member.mention)
-
-        elif content.isdigit():
-            # The input is a numeric Roblox ID
-            roblox_id = content
-            roblox_username = fetch_latest_roblox_username(roblox_id)
-            cursor.execute("SELECT DiscordID FROM Users WHERE RobloxID=%s", (roblox_id,))
-            row = cursor.fetchone()
-
-            if row:
-                # Already in the DB
+        # Co-host
+        cohost_mention_str = "None"
+        if cohost_user is not None:
+            try:
+                cohost_mention_str = cohost_user.mention
+                ensure_user_record(cohost_user, ctx.guild)
                 cursor.execute(
-                    "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE RobloxID=%s",
-                    (roblox_id,)
+                    "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
+                    (str(cohost_user.id),)
                 )
                 conn.commit()
-                attendees_processed.append(str(row[0]))
-            else:
-                # Create new record with DiscordID='0'
-                cursor.execute(
-                    """
-                    INSERT INTO Users (DiscordID, RobloxID, r_user, EventsAttended, EventsHosted,
-                                       FlightMinutes, QuotaMet, Rank, Strikes)
-                    VALUES (%s, %s, %s, 1, 0, 0, FALSE, %s, 0)
-                    """,
-                    ("0", roblox_id, roblox_username, "Unknown")
-                )
-                conn.commit()
-                attendees_processed.append("0")
-            attendee_pings_for_summary.append(f"RobloxID:{roblox_id}")
+            except Exception as e:
+                await ctx.send(f"❌ Error updating co-host record: {str(e)}")
+                # Continue anyway since co-host is optional
 
-        else:
-            await ctx.send(f"❌ Could not parse attendee: {content}. Skipping.")
-            continue
-
-        await asyncio.sleep(RATE_LIMIT_DELAY)
-
-    # Host
-    ensure_user_record(ctx.author, ctx.guild)
-    cursor.execute(
-        "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
-        (str(ctx.author.id),)
-    )
-    conn.commit()
-
-    # Co-host
-    cohost_mention_str = "None"
-    if cohost_user is not None:
-        cohost_mention_str = cohost_user.mention
-        ensure_user_record(cohost_user, ctx.guild)
-        cursor.execute(
-            "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
-            (str(cohost_user.id),)
-        )
-        conn.commit()
-
-    # Recalculate quota
-    recalculate_quota()
+        # Recalculate quota
+        try:
+            recalculate_quota()
+        except Exception as e:
+            await ctx.send(f"⚠️ Warning: Error recalculating quota: {str(e)}")
+            # Continue anyway since quota recalculation is not critical for the event log
+    except Exception as e:
+        await ctx.send(f"❌ Critical error during event logging: {str(e)}")
+        return
 
     # Final summary
-    final_channel = bot.get_channel(830596103434534932)  # or use ctx.channel if you prefer
-    if final_channel is None:
-        final_channel = ctx.channel
+    try:
+        final_channel = bot.get_channel(830596103434534932)  # or use ctx.channel if you prefer
+        if final_channel is None:
+            final_channel = ctx.channel
 
-    host_mention = ctx.author.mention
-    attendees_str = ", ".join(attendee_pings_for_summary) if attendee_pings_for_summary else "None"
+        host_mention = ctx.author.mention
+        attendees_str = ", ".join(attendee_pings_for_summary) if attendee_pings_for_summary else "None"
 
-    await final_channel.send("✅ **Event logging complete!**")
-    await final_channel.send(
-        f"Host: {host_mention}\n"
-        f"Co-host: {cohost_mention_str}\n"
-        f"Event: {event_name}\n"
-        f"Attendees: {attendees_str}\n"
-        f"Proof: {screenshot_url}"
-    )
+        await final_channel.send("✅ **Event logging complete!**")
+        await final_channel.send(
+            f"Host: {host_mention}\n"
+            f"Co-host: {cohost_mention_str}\n"
+            f"Event: {event_name}\n"
+            f"Attendees: {attendees_str}\n"
+            f"Proof: {screenshot_url}"
+        )
 
-    if attendees_processed:
-        await final_channel.send(f"**Attendees DB Updated:** {', '.join(attendees_processed)}")
+        if attendees_processed:
+            await final_channel.send(f"**Attendees DB Updated:** {', '.join(attendees_processed)}")
+    except Exception as e:
+        await ctx.send(f"❌ Error sending final summary: {str(e)}")
+        # Still send a basic confirmation to the original channel
+        await ctx.send("⚠️ Event was logged to database, but there was an error sending the summary.")
         
         
 @bot.command(name="leaderboard")
