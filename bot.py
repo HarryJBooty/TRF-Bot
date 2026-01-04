@@ -1085,92 +1085,139 @@ async def enforce_quota(ctx):
     4) Sends a message listing all members who received a strike.
        - Removes from DB any user who left the server or has invalid DiscordID.
     """
-    recalculate_quota()
-    cursor.execute(
-        """
-        SELECT DiscordID
-        FROM Users
-        WHERE QuotaMet = FALSE
-          AND Inactive = FALSE
-        """
-    )
-    rows = cursor.fetchall()
+    try:
+        recalculate_quota()
+    except Exception as e:
+        await ctx.send(f"❌ Error recalculating quota: {str(e)}")
+        return
+
+    try:
+        cursor.execute(
+            """
+            SELECT DiscordID
+            FROM Users
+            WHERE QuotaMet = FALSE
+              AND Inactive = FALSE
+            """
+        )
+        rows = cursor.fetchall()
+    except Exception as e:
+        await ctx.send(f"❌ Error querying database: {str(e)}")
+        return
 
     striked_members = []
     removed_count = 0
+    error_count = 0
 
-    await ctx.guild.chunk()
+    try:
+        await ctx.guild.chunk()
+    except Exception as e:
+        print(f"Warning: Could not chunk guild: {e}")
+        # Continue anyway, chunking is not critical
 
     for (disc_id_str,) in rows:
-        # Skip if not numeric
-        if not disc_id_str.isdigit():
-            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+        try:
+            # Skip if not numeric
+            if not disc_id_str.isdigit():
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                conn.commit()
+                removed_count += 1
+                continue
+
+            member = ctx.guild.get_member(int(disc_id_str))
+            if not member:
+                # user left => remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                conn.commit()
+                removed_count += 1
+                continue
+
+            # Check exempt roles
+            if any(role.id in exempt_role_ids for role in member.roles):
+                continue
+
+            # Add 1 strike
+            cursor.execute("UPDATE Users SET Strikes = Strikes + 1 WHERE DiscordID=%s", (disc_id_str,))
             conn.commit()
-            removed_count += 1
+            striked_members.append(member.mention)
+        except Exception as e:
+            error_count += 1
+            print(f"Error processing user {disc_id_str}: {e}")
             continue
-
-        member = ctx.guild.get_member(int(disc_id_str))
-        if not member:
-            # user left => remove from DB
-            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
-            conn.commit()
-            removed_count += 1
-            continue
-
-        # Check exempt roles
-        if any(role.id in exempt_role_ids for role in member.roles):
-            continue
-
-        # Add 1 strike
-        cursor.execute("UPDATE Users SET Strikes = Strikes + 1 WHERE DiscordID=%s", (disc_id_str,))
-        conn.commit()
-        striked_members.append(member.mention)
 
     # If no one was striked, send a simple message
     if not striked_members:
         msg = "No users were striked (either no one failed quota or all failing were exempt/inactive)."
         if removed_count > 0:
             msg += f"\nRemoved {removed_count} user(s) who left or had invalid IDs."
-        await ctx.send(msg)
+        if error_count > 0:
+            msg += f"\n⚠️ {error_count} error(s) occurred while processing users."
+        try:
+            await ctx.send(msg)
+        except Exception as e:
+            await ctx.send(f"❌ Error sending message: {str(e)}")
         return
 
-    # Otherwise, build the embed and chunk the striked list so we don’t exceed 1024 chars in one field
-    embed = discord.Embed(
-        title="Enforce Quota",
-        description="The following users have been given **1 Strike** for failing to meet quota:",
-        color=discord.Color.red()
-    )
+    # Otherwise, build the embed and chunk the striked list so we don't exceed 1024 chars in one field
+    try:
+        embed = discord.Embed(
+            title="Enforce Quota",
+            description="The following users have been given **1 Strike** for failing to meet quota:",
+            color=discord.Color.red()
+        )
 
-    # Helper function: chunk a big list into lines that fit within 1024 chars
-    def chunk_lines(lines, max_length=1024):
-        """
-        Takes a list of strings (lines) and yields combined
-        strings that do not exceed max_length in total.
-        """
-        current_chunk = ""
-        for line in lines:
-            # +1 for newline
-            if len(current_chunk) + len(line) + 1 > max_length:
-                yield current_chunk
-                current_chunk = line
-            else:
-                if not current_chunk:
+        # Helper function: chunk a big list into lines that fit within 1024 chars
+        def chunk_lines(lines, max_length=1024):
+            """
+            Takes a list of strings (lines) and yields combined
+            strings that do not exceed max_length in total.
+            """
+            current_chunk = ""
+            for line in lines:
+                # +1 for newline
+                if len(current_chunk) + len(line) + 1 > max_length:
+                    yield current_chunk
                     current_chunk = line
                 else:
-                    current_chunk += "\n" + line
-        if current_chunk:
-            yield current_chunk
+                    if not current_chunk:
+                        current_chunk = line
+                    else:
+                        current_chunk += "\n" + line
+            if current_chunk:
+                yield current_chunk
 
-    # Chunk the striked list (each mention is a line)
-    chunks = list(chunk_lines(striked_members))
-    # Add each chunk as its own field in the embed
-    for i, chunk in enumerate(chunks, start=1):
-        embed.add_field(name=f"Striked (Part {i})", value=chunk, inline=False)
+        # Chunk the striked list (each mention is a line)
+        chunks = list(chunk_lines(striked_members))
+        # Add each chunk as its own field in the embed
+        for i, chunk in enumerate(chunks, start=1):
+            embed.add_field(name=f"Striked (Part {i})", value=chunk, inline=False)
 
-    if removed_count > 0:
-        embed.set_footer(text=f"Also removed {removed_count} user(s) who left or had invalid IDs.")
+        footer_parts = []
+        if removed_count > 0:
+            footer_parts.append(f"Also removed {removed_count} user(s) who left or had invalid IDs.")
+        if error_count > 0:
+            footer_parts.append(f"{error_count} error(s) occurred while processing users.")
+        
+        if footer_parts:
+            embed.set_footer(text=" | ".join(footer_parts))
 
-    await ctx.send(embed=embed)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        # Fallback to simple message if embed fails
+        try:
+            msg = f"✅ **Enforce Quota Complete**\n"
+            msg += f"**{len(striked_members)} user(s) striked:**\n"
+            msg += ", ".join(striked_members[:20])  # Limit to first 20 to avoid message length issues
+            if len(striked_members) > 20:
+                msg += f"\n... and {len(striked_members) - 20} more."
+            if removed_count > 0:
+                msg += f"\nRemoved {removed_count} user(s) who left or had invalid IDs."
+            if error_count > 0:
+                msg += f"\n⚠️ {error_count} error(s) occurred while processing users."
+            await ctx.send(msg)
+        except Exception as e2:
+            await ctx.send(f"❌ Critical error: Could not send results. {str(e)} | {str(e2)}")
+    
 
 
 @bot.command(name="reset_strikes")
